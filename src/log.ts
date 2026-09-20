@@ -29,7 +29,7 @@ export function serializeDiagnostic(entry: Diagnostic): string {
     if (entry.event === "success") return JSON.stringify({
         timestamp, event: entry.event, reason: entry.reason, ...target,
         thinkingLevel: entry.thinkingLevel, tokensBefore: entry.tokensBefore,
-        summaryChars: entry.summaryChars, outputTokens: entry.outputTokens ?? null,
+        summaryChars: entry.summaryChars, outputTokens: entry.outputTokens,
     }) + "\n";
     return JSON.stringify({ timestamp, event: entry.event, ...target,
         ...(entry.event === "error" ? { reason: entry.reason } : {}),

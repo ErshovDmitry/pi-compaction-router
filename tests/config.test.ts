@@ -54,6 +54,12 @@ test("defaults are disabled, thinking off, all reasons, no reserve override", ()
         source: "default", settingsSource: "default" });
 });
 
+test("empty project container inherits global settings source", () => {
+    const result = config(settings({ enabled: true, model }), settings({}));
+    assert.equal(result.config.settingsSource, "global");
+    assert.equal(result.config.model, model);
+});
+
 test("per-field merge inherits omitted global fields and replaces arrays", () => {
     const result = config(settings({ enabled: true, model, debug: true, reasons: ["manual"] }),
         settings({ thinkingLevel: "high", reasons: ["overflow"] })).config;
@@ -95,7 +101,7 @@ test("enabled without model is inactive, retains other fields, and warns once", 
 
 test("validators reject malformed layers rather than silently widening filters", () => {
     const bad = [{ enabled: "true" }, { debug: 1 }, { thinkingLevel: "invalid" },
-        { reserveTokens: 1.5 }, { reserveTokens: Infinity }, { reasons: ["unknown"] },
+        { reserveTokens: "1500" }, { thinkingLevel: ["off"] }, { reasons: ["unknown"] },
         { onlyForActiveModels: ["invalid"] }, { debugPath: "" }, { debugPath: "x\u0000y" }];
     for (const invalid of bad) {
         const result = config(settings({ enabled: true, model, ...invalid }));
@@ -103,10 +109,29 @@ test("validators reject malformed layers rather than silently widening filters",
         assert.equal(result.config.source, "default");
         assert.equal(result.warnings.length, 1);
     }
+    assert.equal(config(settings({ enabled: true, model, thinkingLevel: 1 })).config.enabled, false);
+
+    const mixed = config(settings({ enabled: true, model }), settings({ debug: "bad" }));
+    assert.equal(mixed.config.source, "default");
+    assert.equal(mixed.warnings.length, 1);
     for (const thinkingLevel of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
         assert.equal(config(settings({ thinkingLevel })).config.thinkingLevel, thinkingLevel);
     }
     assert.equal(config(settings({ unknown: true })).warnings.length, 0);
+});
+
+test("non-integer reserveTokens is dropped while the layer survives", () => {
+    for (const reserveTokens of [1500.5, Infinity, NaN]) {
+        const result = config(settings({ enabled: true, model, reserveTokens }));
+        assert.equal(result.config.reserveTokens, undefined);
+        assert.equal(result.config.enabled, true);
+        assert.equal(result.config.model, model);
+        assert.equal(result.warnings.length, 1);
+        const warn = createWarnOnce();
+        const notices: string[] = [];
+        for (let i = 0; i < 2; i++) warn("config", (msg) => notices.push(msg), result.warnings[0]);
+        assert.equal(notices.length, 1);
+    }
 });
 
 test("clamps integers and deduplicates normalized lists preserving order", () => {
@@ -145,7 +170,7 @@ test("aborted compaction returns silently", async () => {
     assert.equal(active.notices.some((message) => message.includes("falling back")), false);
 });
 
-test("auth failure warns once and falls back", async () => {
+test("auth failure warns once and still attempts compaction", async () => {
     const f = fixture();
     const calls: unknown[][] = [];
     const run: typeof compactSuccess = async (...args) => {
@@ -166,6 +191,16 @@ test("auth failure warns once and falls back", async () => {
     assert.notEqual(calls[0][11], calls[1][11]);
 });
 
+test("throwing UI does not prevent success or fallback", async () => {
+    const f = fixture();
+    f.ctx.ui.notify = () => { throw Error("UI unavailable"); };
+    f.ctx.ui.setStatus = () => { throw Error("UI unavailable"); };
+    assert.ok(await routeCompaction(f.event, f.ctx, f.load, compactSuccess));
+    assert.equal(await routeCompaction(f.event, f.ctx, f.load, async () => {
+        throw Error("compaction failed");
+    }), undefined);
+});
+
 test("compact error returns undefined", async () => {
     const f = fixture();
     const result = await routeCompaction(f.event, f.ctx, f.load, async () => {
@@ -174,6 +209,11 @@ test("compact error returns undefined", async () => {
     assert.equal(result, undefined);
     assert.ok(f.notices.some((message) => message.includes("falling back")));
     assert.equal(f.notices.some((message) => message.includes("private provider")), false);
+});
+
+test("undefined reserveTokens preserves preparation identity", () => {
+    const { event } = fixture();
+    assert.equal(prepareForRouter(event.preparation, undefined), event.preparation);
 });
 
 test("does not mutate preparation", () => {
@@ -186,6 +226,11 @@ test("does not mutate preparation", () => {
     assert.equal(event.preparation.settings.reserveTokens, 4096);
     assert.equal(result.messagesToSummarize, event.preparation.messagesToSummarize);
     assert.equal(result.settings.keepRecentTokens, 1000);
+});
+
+test("success diagnostics omit absent outputTokens", () => {
+    const record = JSON.parse(serializeDiagnostic(success));
+    assert.equal("outputTokens" in record, false);
 });
 
 test("pairs session_compact_failed diagnostics", () => {

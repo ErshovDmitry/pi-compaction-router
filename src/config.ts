@@ -58,21 +58,20 @@ export function normalizeReasons(value: unknown): CompactionReason[] | undefined
     return [...new Set(value)] as CompactionReason[];
 }
 
-function validFields(value: Record<string, unknown>): boolean {
+function hasFatalFieldErrors(value: Record<string, unknown>): boolean {
     if (["enabled", "debug"].some((key) => key in value && typeof value[key] !== "boolean")) {
-        return false;
+        return true;
     }
-    if ("thinkingLevel" in value && !THINKING_LEVELS.includes(String(value.thinkingLevel))) {
-        return false;
-    }
-    if ("reserveTokens" in value && !Number.isInteger(value.reserveTokens)) return false;
-    if ("reasons" in value && normalizeReasons(value.reasons) === undefined) return false;
+    if ("thinkingLevel" in value && (typeof value.thinkingLevel !== "string" ||
+        !THINKING_LEVELS.includes(value.thinkingLevel))) return true;
+    if ("reserveTokens" in value && typeof value.reserveTokens !== "number") return true;
+    if ("reasons" in value && normalizeReasons(value.reasons) === undefined) return true;
     if ("onlyForActiveModels" in value && (!Array.isArray(value.onlyForActiveModels) ||
-        !value.onlyForActiveModels.every((item) => parseModel(item) !== undefined))) return false;
+        !value.onlyForActiveModels.every((item) => parseModel(item) !== undefined))) return true;
     if ("debugPath" in value && (typeof value.debugPath !== "string" ||
-        !value.debugPath.trim() || /[\x00-\x1f\x7f]/.test(value.debugPath))) return false;
+        !value.debugPath.trim() || /[\x00-\x1f\x7f]/.test(value.debugPath))) return true;
     // A missing/invalid target makes an enabled router inactive, not a malformed layer.
-    return true;
+    return false;
 }
 
 function settingsLayer(globalSettings: unknown, projectSettings: unknown) {
@@ -83,11 +82,16 @@ function settingsLayer(globalSettings: unknown, projectSettings: unknown) {
     const hasFields = (value: unknown) => isRecord(value) && KEYS.some((key) => key in value);
     const source: SettingsSource = hasFields(project) ? "project" : hasFields(global)
         ? "global" : "default";
-    if (malformed || !validFields(merged)) {
+    if (malformed || hasFatalFieldErrors(merged)) {
         return { values: {} as RouterSettings, source: "default" as const,
             warnings: ["malformed compactionRouter settings; using defaults"] };
     }
-    return { values: merged as RouterSettings, source, warnings: [] as string[] };
+    const warnings: string[] = [];
+    if ("reserveTokens" in merged && !Number.isInteger(merged.reserveTokens)) {
+        delete merged.reserveTokens;
+        warnings.push("invalid reserveTokens; using pi default");
+    }
+    return { values: merged as RouterSettings, source, warnings };
 }
 
 /** Resolve explicit settings and environment without pi, filesystem, or notification calls. */
@@ -135,9 +139,9 @@ const warnOnce = createWarnOnce();
 export async function loadEffectiveConfig(
     cwd: string, notify: Notify, env: Environment = process.env, projectTrusted = false,
 ): Promise<ConfigResolution> {
-    const { getAgentDir, SettingsManager } = await import("@earendil-works/pi-coding-agent");
-    const agentDir = getAgentDir();
     try {
+        const { getAgentDir, SettingsManager } = await import("@earendil-works/pi-coding-agent");
+        const agentDir = getAgentDir();
         const manager = SettingsManager.create(cwd, agentDir, { projectTrusted });
         const result = resolveConfig(
             manager.getGlobalSettings(), manager.getProjectSettings(), env, agentDir,
@@ -145,11 +149,21 @@ export async function loadEffectiveConfig(
         if (manager.drainErrors().length) {
             result.warnings.push("could not read settings; unavailable settings ignored");
         }
-        for (const warning of result.warnings) warnOnce("config", notify, warning);
+        for (const warning of result.warnings) {
+            try {
+                warnOnce("config", notify, warning);
+            } catch {
+                // Notifications are best effort; settings resolution must continue.
+            }
+        }
         return result;
     } catch {
-        warnOnce("config", notify, "could not load settings; using defaults");
-        return resolveConfig({}, {}, env, agentDir);
+        try {
+            warnOnce("config", notify, "could not load settings; using defaults");
+        } catch {
+            // Notifications are best effort; the fallback must never reject.
+        }
+        return resolveConfig({}, {}, env, ".");
     }
 }
 

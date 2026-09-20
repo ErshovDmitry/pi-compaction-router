@@ -5,7 +5,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import {
     createWarnOnce, isRecord, loadEffectiveConfig, normalizeReasons, parseModel, shouldRoute,
     type EffectiveConfig, type RouterSettings,
@@ -14,6 +14,22 @@ import { writeDiagnostic, type Diagnostic } from "./log.ts";
 
 const STATUS_KEY = "compaction-router";
 const warnOnce = createWarnOnce();
+const safeNotify = (ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void } },
+    message: string, type?: "info" | "warning" | "error"): void => {
+    try {
+        ctx.ui.notify(message, type);
+    } catch {
+        // UI failures must not affect compaction.
+    }
+};
+const safeSetStatus = (ctx: { ui: { setStatus: (key: string, value: string | undefined) => void } },
+    value: string | undefined): void => {
+    try {
+        ctx.ui.setStatus(STATUS_KEY, value);
+    } catch {
+        // UI failures must not affect compaction.
+    }
+};
 const log = (config: EffectiveConfig, entry: Diagnostic): void => {
     if (config.debug) writeDiagnostic(config.debugPath, entry);
 };
@@ -76,7 +92,8 @@ export async function persistSettings(path: string, patch: RouterSettings): Prom
 }
 
 async function handleCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
-    const notify = ctx.ui.notify.bind(ctx.ui);
+    const notify = (message: string, type?: "info" | "warning" | "error") =>
+        safeNotify(ctx, message, type);
     try {
         if (!args.trim() || args.trim() === "status") {
             const { config } = await loadEffectiveConfig(
@@ -116,7 +133,8 @@ async function runCompact(
     model: NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>>,
     compactFn: typeof compact,
 ) {
-    const notify = ctx.ui.notify.bind(ctx.ui);
+    const notify = (message: string, type?: "info" | "warning" | "error") =>
+        safeNotify(ctx, message, type);
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (event.signal.aborted) return undefined;
     if (!auth.ok) {
@@ -129,7 +147,7 @@ async function runCompact(
     ) : undefined;
     const streamFn = ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as
         Parameters<typeof compact>[7];
-    ctx.ui.setStatus(STATUS_KEY, `summarizing via ${config.model}…`);
+    safeSetStatus(ctx, `summarizing via ${config.model}…`);
     const result = await compactFn(
         prepareForRouter(event.preparation, config.reserveTokens), model,
         auth.ok ? auth.apiKey : undefined, headers, event.customInstructions, event.signal,
@@ -154,15 +172,15 @@ export async function routeCompaction(
     let config: EffectiveConfig | undefined;
     try {
         if (event.signal.aborted) return undefined;
-        config = (await load(ctx.cwd, ctx.ui.notify.bind(ctx.ui), process.env,
-            ctx.isProjectTrusted())).config;
+        config = (await load(ctx.cwd, (message, type) => safeNotify(ctx, message, type),
+            process.env, ctx.isProjectTrusted())).config;
         const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
         if (!shouldRoute(config, active, event.reason, event.signal.aborted)) return undefined;
         const slash = config.model!.indexOf("/");
         const model = ctx.modelRegistry.find(config.model!.slice(0, slash),
             config.model!.slice(slash + 1));
         if (!model) {
-            ctx.ui.notify(`compaction-router: model ${config.model} not found`, "warning");
+            safeNotify(ctx, `compaction-router: model ${config.model} not found`, "warning");
             return undefined;
         }
         return await runCompact(event, ctx, config, model, compactFn);
@@ -174,10 +192,10 @@ export async function routeCompaction(
                 provider: config.model?.slice(0, slash) ?? "unknown",
                 modelId: config.model?.slice(slash + 1) ?? "unknown", error: "compaction failed" });
         }
-        ctx.ui.notify("compaction-router: failed; falling back to default compaction", "error");
+        safeNotify(ctx, "compaction-router: failed; falling back to default compaction", "error");
         return undefined;
     } finally {
-        ctx.ui.setStatus(STATUS_KEY, undefined);
+        safeSetStatus(ctx, undefined);
     }
 }
 
@@ -185,11 +203,16 @@ export async function routeCompaction(
 export default function register(pi: ExtensionAPI): void {
     pi.on("session_before_compact", (event, ctx) => routeCompaction(event, ctx));
     pi.on("session_compact_failed", async (event, ctx) => {
-        const { config } = await loadEffectiveConfig(ctx.cwd, ctx.ui.notify.bind(ctx.ui),
-            process.env, ctx.isProjectTrusted());
-        log(config, { event: "compact-failed", reason: event.reason,
-            fromExtension: event.fromExtension, errorMessage: event.errorMessage,
-            aborted: event.aborted, willRetry: event.willRetry });
+        try {
+            const { config } = await loadEffectiveConfig(ctx.cwd,
+                (message, type) => safeNotify(ctx, message, type), process.env,
+                ctx.isProjectTrusted());
+            log(config, { event: "compact-failed", reason: event.reason,
+                fromExtension: event.fromExtension, errorMessage: event.errorMessage,
+                aborted: event.aborted, willRetry: event.willRetry });
+        } catch {
+            // Failure diagnostics must never disrupt pi's compaction lifecycle.
+        }
     });
     pi.registerCommand("compact-router", {
         description: "Inspect or configure compaction model routing",
