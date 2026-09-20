@@ -86,6 +86,4 @@ separately.
 
 ## Compatibility
 
-Requires pi 0.86.1-compatible extension APIs and Node.js 20 or newer. The package uses
-public `ExtensionAPI`, `SettingsManager`, `compact()`, and model registry APIs. TypeScript
-is loaded natively by pi; no build output is required.
+The extension host (pi 0.86.x) itself requires Node ≥22.19 at runtime; the package's own typecheck/tests run on Node 20 and 22.

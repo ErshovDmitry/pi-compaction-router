@@ -1,7 +1,6 @@
-import {
-    compact, getAgentDir, withFileMutationQueue,
-    type ExtensionAPI, type ExtensionContext, type ExtensionCommandContext,
-    type SessionBeforeCompactEvent, type SessionBeforeCompactResult,
+import type {
+    ExtensionAPI, ExtensionContext, ExtensionCommandContext,
+    SessionBeforeCompactEvent, SessionBeforeCompactResult,
 } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
@@ -11,6 +10,8 @@ import {
     type EffectiveConfig, type RouterSettings,
 } from "./config.ts";
 import { writeDiagnostic, type Diagnostic } from "./log.ts";
+
+type Compact = typeof import("@earendil-works/pi-coding-agent").compact;
 
 const STATUS_KEY = "compaction-router";
 const warnOnce = createWarnOnce();
@@ -72,6 +73,7 @@ async function readTarget(path: string): Promise<Record<string, unknown>> {
 
 /** Preserve unrelated keys and replace only the selected settings file atomically. */
 export async function persistSettings(path: string, patch: RouterSettings): Promise<void> {
+    const { withFileMutationQueue } = await import("@earendil-works/pi-coding-agent");
     await withFileMutationQueue(path, async () => {
         const settings = await readTarget(path);
         const current = isRecord(settings.compactionRouter) ? settings.compactionRouter : {};
@@ -107,6 +109,7 @@ async function handleCommand(args: string, ctx: ExtensionCommandContext): Promis
             notify("usage: /compact-router [status | off | provider/model | reasons list]", "error");
             return;
         }
+        const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
         const trusted = ctx.isProjectTrusted();
         const path = trusted ? join(ctx.cwd, ".pi", "settings.json")
             : join(getAgentDir(), "settings.json");
@@ -131,7 +134,7 @@ export function prepareForRouter(
 async function runCompact(
     event: SessionBeforeCompactEvent, ctx: ExtensionContext, config: EffectiveConfig,
     model: NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>>,
-    compactFn: typeof compact,
+    compactFn: Compact,
 ) {
     const notify = (message: string, type?: "info" | "warning" | "error") =>
         safeNotify(ctx, message, type);
@@ -146,7 +149,7 @@ async function runCompact(
         Object.entries(auth.headers).filter((entry): entry is [string, string] => entry[1] !== null),
     ) : undefined;
     const streamFn = ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as
-        Parameters<typeof compact>[7];
+        Parameters<Compact>[7];
     safeSetStatus(ctx, `summarizing via ${config.model}…`);
     const result = await compactFn(
         prepareForRouter(event.preparation, config.reserveTokens), model,
@@ -167,7 +170,7 @@ async function runCompact(
 /** Injectable pi boundary for offline runtime-behavior tests. */
 export async function routeCompaction(
     event: SessionBeforeCompactEvent, ctx: ExtensionContext,
-    load = loadEffectiveConfig, compactFn = compact,
+    load = loadEffectiveConfig, compactFn?: Compact,
 ): Promise<SessionBeforeCompactResult | undefined> {
     let config: EffectiveConfig | undefined;
     try {
@@ -182,6 +185,10 @@ export async function routeCompaction(
         if (!model) {
             safeNotify(ctx, `compaction-router: model ${config.model} not found`, "warning");
             return undefined;
+        }
+        if (!compactFn) {
+            const { compact } = await import("@earendil-works/pi-coding-agent");
+            compactFn = compact;
         }
         return await runCompact(event, ctx, config, model, compactFn);
     } catch (error) {
