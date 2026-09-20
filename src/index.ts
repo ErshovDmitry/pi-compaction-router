@@ -1,0 +1,198 @@
+import {
+    compact, getAgentDir, withFileMutationQueue,
+    type ExtensionAPI, type ExtensionContext, type ExtensionCommandContext,
+    type SessionBeforeCompactEvent, type SessionBeforeCompactResult,
+} from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import {
+    createWarnOnce, isRecord, loadEffectiveConfig, normalizeReasons, parseModel, shouldRoute,
+    type EffectiveConfig, type RouterSettings,
+} from "./config.ts";
+import { writeDiagnostic, type Diagnostic } from "./log.ts";
+
+const STATUS_KEY = "compaction-router";
+const warnOnce = createWarnOnce();
+const log = (config: EffectiveConfig, entry: Diagnostic): void => {
+    if (config.debug) writeDiagnostic(config.debugPath, entry);
+};
+
+/** Render all effective fields, including the settings source hidden by an env override. */
+export function statusText(config: EffectiveConfig): string {
+    const source = config.source === "env" ? `env (settings: ${config.settingsSource})` : config.source;
+    return `enabled=${config.enabled}, model=${config.model ?? "none"}, ` +
+        `thinkingLevel=${config.thinkingLevel}, reserveTokens=${config.reserveTokens ?? "pi default"}, ` +
+        `onlyForActiveModels=${config.onlyForActiveModels.join(",") || "all"}, ` +
+        `reasons=${config.reasons.join(",") || "none"}, debug=${config.debug}, ` +
+        `debugPath=${config.debugPath}, source=${source}`;
+}
+
+/** Parse only supported mutations; undefined means invalid command syntax. */
+export function commandPatch(args: string): RouterSettings | undefined {
+    const value = args.trim();
+    if (value === "off") return { enabled: false };
+    if (/^reasons\s/.test(value)) {
+        const reasons = normalizeReasons(value.slice(7).trim().split(/[\s,]+/));
+        return reasons ? { reasons } : undefined;
+    }
+    const model = parseModel(value);
+    return model ? { enabled: true, model } : undefined;
+}
+
+async function readTarget(path: string): Promise<Record<string, unknown>> {
+    let text: string;
+    try {
+        text = await readFile(path, "utf8");
+    } catch (error) {
+        if (isRecord(error) && error.code === "ENOENT") return {};
+        throw new Error("Cannot read settings; file unchanged");
+    }
+    const parsed: unknown = JSON.parse(text);
+    if (!isRecord(parsed) || (parsed.compactionRouter !== undefined &&
+        !isRecord(parsed.compactionRouter))) throw new Error("Malformed settings; file unchanged");
+    return parsed;
+}
+
+/** Preserve unrelated keys and replace only the selected settings file atomically. */
+export async function persistSettings(path: string, patch: RouterSettings): Promise<void> {
+    await withFileMutationQueue(path, async () => {
+        const settings = await readTarget(path);
+        const current = isRecord(settings.compactionRouter) ? settings.compactionRouter : {};
+        const next = { ...settings, compactionRouter: { ...current, ...patch } };
+        await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+        const tempPath = `${path}.${randomUUID()}.tmp`;
+        let created = false;
+        try {
+            await writeFile(tempPath, `${JSON.stringify(next, null, 4)}\n`, {
+                encoding: "utf8", flag: "wx", mode: 0o600,
+            });
+            created = true;
+            await rename(tempPath, path);
+        } finally {
+            if (created) await unlink(tempPath).catch(() => { /* Renamed or already removed. */ });
+        }
+    });
+}
+
+async function handleCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const notify = ctx.ui.notify.bind(ctx.ui);
+    try {
+        if (!args.trim() || args.trim() === "status") {
+            const { config } = await loadEffectiveConfig(
+                ctx.cwd, notify, process.env, ctx.isProjectTrusted(),
+            );
+            notify(`compaction-router: ${statusText(config)}`, "info");
+            return;
+        }
+        const patch = commandPatch(args);
+        if (!patch) {
+            notify("usage: /compact-router [status | off | provider/model | reasons list]", "error");
+            return;
+        }
+        const trusted = ctx.isProjectTrusted();
+        const path = trusted ? join(ctx.cwd, ".pi", "settings.json")
+            : join(getAgentDir(), "settings.json");
+        await persistSettings(path, patch);
+        const { config } = await loadEffectiveConfig(ctx.cwd, notify, process.env, trusted);
+        const suffix = config.source === "env" ? "; PI_COMPACTION_ROUTER still overrides settings" : "";
+        notify(`compaction-router: saved ${path}${trusted ? "" : " (untrusted project: global)"}` +
+            suffix, "info");
+    } catch {
+        notify("compaction-router: could not save/read settings; check JSON and permissions", "error");
+    }
+}
+
+/** Copy only the overridden preparation/settings layers, preserving all other fields. */
+export function prepareForRouter(
+    preparation: SessionBeforeCompactEvent["preparation"], reserveTokens: number | undefined,
+): SessionBeforeCompactEvent["preparation"] {
+    if (reserveTokens === undefined) return preparation;
+    return { ...preparation, settings: { ...preparation.settings, reserveTokens } };
+}
+
+async function runCompact(
+    event: SessionBeforeCompactEvent, ctx: ExtensionContext, config: EffectiveConfig,
+    model: NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>>,
+    compactFn: typeof compact,
+) {
+    const notify = ctx.ui.notify.bind(ctx.ui);
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (event.signal.aborted) return undefined;
+    if (!auth.ok) {
+        warnOnce("auth", notify, "authentication resolution failed; retrying through pi's stream");
+        log(config, { event: "auth-failed", provider: model.provider, modelId: model.id,
+            error: "authentication failed" });
+    }
+    const headers = auth.ok && auth.headers ? Object.fromEntries(
+        Object.entries(auth.headers).filter((entry): entry is [string, string] => entry[1] !== null),
+    ) : undefined;
+    const streamFn = ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as
+        Parameters<typeof compact>[7];
+    ctx.ui.setStatus(STATUS_KEY, `summarizing via ${config.model}…`);
+    const result = await compactFn(
+        prepareForRouter(event.preparation, config.reserveTokens), model,
+        auth.ok ? auth.apiKey : undefined, headers, event.customInstructions, event.signal,
+        config.thinkingLevel === "off" ? undefined : config.thinkingLevel,
+        streamFn, auth.ok ? auth.env : undefined, undefined, undefined, randomUUID(),
+    );
+    if (event.signal.aborted) return undefined;
+    log(config, { event: "success", reason: event.reason, provider: model.provider, modelId: model.id,
+        thinkingLevel: config.thinkingLevel, tokensBefore: result.tokensBefore,
+        summaryChars: result.summary.length, outputTokens: result.usage?.output });
+    const usage = result.usage?.output;
+    notify(`compaction-router: ${config.model} — ${result.tokensBefore} tokens → ` +
+        `${result.summary.length} chars${usage === undefined ? "" : `, ${usage} output tokens`}`, "info");
+    return { compaction: result };
+}
+
+/** Injectable pi boundary for offline runtime-behavior tests. */
+export async function routeCompaction(
+    event: SessionBeforeCompactEvent, ctx: ExtensionContext,
+    load = loadEffectiveConfig, compactFn = compact,
+): Promise<SessionBeforeCompactResult | undefined> {
+    let config: EffectiveConfig | undefined;
+    try {
+        if (event.signal.aborted) return undefined;
+        config = (await load(ctx.cwd, ctx.ui.notify.bind(ctx.ui), process.env,
+            ctx.isProjectTrusted())).config;
+        const active = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+        if (!shouldRoute(config, active, event.reason, event.signal.aborted)) return undefined;
+        const slash = config.model!.indexOf("/");
+        const model = ctx.modelRegistry.find(config.model!.slice(0, slash),
+            config.model!.slice(slash + 1));
+        if (!model) {
+            ctx.ui.notify(`compaction-router: model ${config.model} not found`, "warning");
+            return undefined;
+        }
+        return await runCompact(event, ctx, config, model, compactFn);
+    } catch (error) {
+        if (event.signal.aborted || (isRecord(error) && error.name === "AbortError")) return undefined;
+        if (config) {
+            const slash = config.model?.indexOf("/") ?? -1;
+            log(config, { event: "error", reason: event.reason,
+                provider: config.model?.slice(0, slash) ?? "unknown",
+                modelId: config.model?.slice(slash + 1) ?? "unknown", error: "compaction failed" });
+        }
+        ctx.ui.notify("compaction-router: failed; falling back to default compaction", "error");
+        return undefined;
+    } finally {
+        ctx.ui.setStatus(STATUS_KEY, undefined);
+    }
+}
+
+/** Register native compaction routing, failure diagnostics, and the settings command. */
+export default function register(pi: ExtensionAPI): void {
+    pi.on("session_before_compact", (event, ctx) => routeCompaction(event, ctx));
+    pi.on("session_compact_failed", async (event, ctx) => {
+        const { config } = await loadEffectiveConfig(ctx.cwd, ctx.ui.notify.bind(ctx.ui),
+            process.env, ctx.isProjectTrusted());
+        log(config, { event: "compact-failed", reason: event.reason,
+            fromExtension: event.fromExtension, errorMessage: event.errorMessage,
+            aborted: event.aborted, willRetry: event.willRetry });
+    });
+    pi.registerCommand("compact-router", {
+        description: "Inspect or configure compaction model routing",
+        handler: handleCommand,
+    });
+}
