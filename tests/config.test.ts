@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { setImmediate } from "node:timers/promises";
 import type { ExtensionContext, SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
-import { createWarnOnce, resolveConfig, shouldRoute, parseModel, normalizeReasons } from "../src/config.ts";
+import {
+    createWarnOnce, resolveConfig, shouldRoute, parseModel, normalizeReasons,
+} from "../src/config.ts";
 import { commandPatch, prepareForRouter, routeCompaction, statusText } from "../src/index.ts";
 import { createDiagnosticWriter, serializeDiagnostic, type Diagnostic } from "../src/log.ts";
 
@@ -49,7 +50,8 @@ const compactSuccess: NonNullable<Parameters<typeof routeCompaction>[3]> = async
 
 test("defaults are disabled, thinking off, all reasons, no reserve override", () => {
     assert.deepEqual(config().config, { enabled: false, model: undefined, thinkingLevel: "off",
-        reserveTokens: undefined, onlyForActiveModels: [], reasons: ["manual", "threshold", "overflow"],
+        reserveTokens: undefined, onlyForActiveModels: [],
+        reasons: ["manual", "threshold", "overflow"],
         debug: false, debugPath: `${agentDir}/logs/compaction-router.log`,
         source: "default", settingsSource: "default" });
 });
@@ -109,7 +111,8 @@ test("validators reject malformed layers rather than silently widening filters",
         assert.equal(result.config.source, "default");
         assert.equal(result.warnings.length, 1);
     }
-    assert.equal(config(settings({ enabled: true, model, thinkingLevel: 1 })).config.enabled, false);
+    assert.equal(config(settings({ enabled: true, model, thinkingLevel: 1 }))
+        .config.enabled, false);
 
     const mixed = config(settings({ enabled: true, model }), settings({ debug: "bad" }));
     assert.equal(mixed.config.source, "default");
@@ -204,11 +207,12 @@ test("throwing UI does not prevent success or fallback", async () => {
 test("compact error returns undefined", async () => {
     const f = fixture();
     const result = await routeCompaction(f.event, f.ctx, f.load, async () => {
-        throw new Error("private provider payload");
+        throw new Error("provider failed token=private-provider-payload");
     });
     assert.equal(result, undefined);
     assert.ok(f.notices.some((message) => message.includes("falling back")));
-    assert.equal(f.notices.some((message) => message.includes("private provider")), false);
+    assert.equal(f.notices.some((message) => message.includes("private-provider-payload")), false);
+    assert.ok(f.notices.some((message) => message.includes("provider failed token=[redacted]")));
 });
 
 test("undefined reserveTokens preserves preparation identity", () => {
@@ -235,13 +239,11 @@ test("success diagnostics omit absent outputTokens", () => {
 
 test("pairs session_compact_failed diagnostics", () => {
     const record = JSON.parse(serializeDiagnostic({ event: "compact-failed", reason: "overflow",
-        fromExtension: true, aborted: true, willRetry: true, errorMessage: "secret /private/path" }));
-    assert.equal(record.event, "compact-failed");
-    assert.equal(record.reason, "overflow");
-    assert.equal(record.aborted, true);
-    assert.equal(record.willRetry, true);
-    assert.equal(record.fromExtension, true);
-    assert.equal(record.errorMessage, "compaction failed");
+        fromExtension: true, aborted: true, willRetry: true,
+        errorMessage: "secret /private/path" }));
+    assert.deepEqual(record, { timestamp: record.timestamp, event: "compact-failed",
+        reason: "overflow", aborted: true, willRetry: true, fromExtension: true,
+        errorMessage: "compaction failed" });
     assert.equal(typeof record.timestamp, "string");
 });
 
@@ -249,7 +251,8 @@ test("clears status on every exit", async () => {
     for (const mode of ["success", "disabled", "abort", "failure", "lookup"]) {
         const f = fixture(mode === "abort");
         if (mode === "lookup") f.ctx.modelRegistry.find = () => undefined;
-        const load = async () => ({ config: { ...enabled, enabled: mode !== "disabled" }, warnings: [] });
+        const load = async () => ({ config: { ...enabled, enabled: mode !== "disabled" },
+            warnings: [] });
         await routeCompaction(f.event, f.ctx, load, mode === "failure" ? async () => {
             throw new Error("failed");
         } : compactSuccess);
@@ -263,21 +266,18 @@ test("debug logging never blocks compaction", async () => {
     const lines: string[] = [];
     const writer = createDiagnosticWriter({ mkdir: () => pending,
         append: async (_path, line) => { lines.push(line); } });
-    assert.equal(writer("logs/test.log", success), undefined);
-    writer("logs/test.log", { ...success, summaryChars: 20 });
-    await setImmediate();
+    const first = writer("logs/test.log", success);
+    const second = writer("logs/test.log", { ...success, summaryChars: 20 });
     assert.equal(lines.length, 0);
     release();
-    await setImmediate();
+    await Promise.all([first, second]);
     assert.deepEqual(lines.map((line) => JSON.parse(line).summaryChars), [10, 20]);
     let attempts = 0;
-    const broken = createDiagnosticWriter({ mkdir: async () => { attempts++; throw Error("disk"); },
+    const broken = createDiagnosticWriter({
+        mkdir: async () => { attempts++; throw Error("disk"); },
         append: async () => assert.fail("must not append after mkdir failure") });
-    broken("logs/test.log", success);
-    broken("logs/test.log", success);
-    await setImmediate();
-    broken("logs/test.log", success);
-    await setImmediate();
+    await Promise.all([broken("logs/test.log", success), broken("logs/test.log", success)]);
+    await broken("logs/test.log", success);
     assert.equal(attempts, 1);
 });
 

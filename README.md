@@ -53,6 +53,21 @@ with a warning, preserving other fields. Empty `onlyForActiveModels` and absent
 | `debug` | `false` |
 | `debugPath` | `<agent-dir>/logs/compaction-router.log` |
 
+## Migrating from the local compaction-model extension
+
+Update references to the old local extension to use these names:
+
+- Environment variable: `PI_COMPACTION_ROUTER`.
+- Command: `/compact-router`.
+- Default debug log: `logs/compaction-router.log` under the pi agent directory
+  (normally `~/.pi/agent`); `debugPath` can override this location.
+
+Move settings from the standalone `compaction-model.json` into the `compactionRouter`
+key in pi's global `~/.pi/agent/settings.json` or trusted project `.pi/settings.json`,
+using the structure shown above. Old configuration keys map 1:1 inside this block;
+keep unrelated pi settings intact. The standalone file is no longer used.
+Project fields override global fields, and environment overrides remain strongest.
+
 ## Command
 
 - `/compact-router` or `/compact-router status` shows effective configuration.

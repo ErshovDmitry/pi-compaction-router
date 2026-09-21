@@ -7,6 +7,7 @@ export type Diagnostic =
     | { event: "success"; reason: CompactionReason; provider: string; modelId: string;
         thinkingLevel: string; tokensBefore: number; summaryChars: number; outputTokens?: number }
     | { event: "error"; reason: CompactionReason; provider: string; modelId: string; error: string }
+    | { event: "skipped"; reason: CompactionReason; provider: string; modelId: string }
     | { event: "auth-failed"; provider: string; modelId: string; error: string }
     | { event: "compact-failed"; reason: CompactionReason; fromExtension: boolean;
         errorMessage?: string; aborted: boolean; willRetry: boolean };
@@ -25,11 +26,16 @@ export function serializeDiagnostic(entry: Diagnostic): string {
         errorMessage: entry.errorMessage === undefined ? undefined : "compaction failed",
         aborted: entry.aborted, willRetry: entry.willRetry,
     }) + "\n";
-    const target = { provider: safeIdentifier(entry.provider), modelId: safeIdentifier(entry.modelId) };
+    const target = {
+        provider: safeIdentifier(entry.provider), modelId: safeIdentifier(entry.modelId),
+    };
     if (entry.event === "success") return JSON.stringify({
         timestamp, event: entry.event, reason: entry.reason, ...target,
         thinkingLevel: entry.thinkingLevel, tokensBefore: entry.tokensBefore,
         summaryChars: entry.summaryChars, outputTokens: entry.outputTokens,
+    }) + "\n";
+    if (entry.event === "skipped") return JSON.stringify({
+        timestamp, event: entry.event, reason: entry.reason, ...target,
     }) + "\n";
     return JSON.stringify({ timestamp, event: entry.event, ...target,
         ...(entry.event === "error" ? { reason: entry.reason } : {}),
@@ -43,7 +49,7 @@ export interface LogIO {
     append(path: string, line: string): Promise<unknown>;
 }
 
-/** One serialized queue; a failed write permanently disables this writer. */
+/** Serialized best-effort queue; returns completion for tests, disables itself on write failure. */
 export function createDiagnosticWriter(io: LogIO = {
     mkdir: (path) => mkdir(path, { recursive: true, mode: 0o700 }),
     append: (path, line) => appendFile(path, line, { encoding: "utf8", mode: 0o600 }),
@@ -51,8 +57,8 @@ export function createDiagnosticWriter(io: LogIO = {
     let queue = Promise.resolve();
     let dirReady: string | undefined;
     let disabled = false;
-    return (path: string, diagnostic: Diagnostic): void => {
-        if (disabled) return;
+    return (path: string, diagnostic: Diagnostic): Promise<void> => {
+        if (disabled) return queue;
         queue = queue.then(async () => {
             if (disabled) return;
             const directory = dirname(path);
@@ -62,6 +68,7 @@ export function createDiagnosticWriter(io: LogIO = {
             }
             await io.append(path, serializeDiagnostic(diagnostic));
         }).catch(() => { disabled = true; });
+        return queue;
     };
 }
 
